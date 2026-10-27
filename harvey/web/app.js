@@ -414,6 +414,7 @@ function loadCurrentTab() {
     case 'campaigns': loadCampaigns(); break;
     case 'outbox': loadOutbox(); break;
     case 'conversations': loadConversations(); break;
+    case 'calendar': loadCalendar(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'settings': loadSettings(); loadSendingModeCard(); break;
@@ -2568,6 +2569,283 @@ async function loadActivity() {
   el.innerHTML = html + '</div></div>';
 }
 
+
+// ── Calendar: human-reviewed booking workflow ──
+
+let _calendarSlots = [];
+let _calendarSelectedSlot = null;
+let _calendarStatus = {configured: false, booking_enabled: false};
+let _calendarProspects = [];
+
+function calendarDate(offsetDays) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+function calendarSlotLabel(slot) {
+  const zone = document.getElementById('calendar-timezone')?.value || 'UTC';
+  const format = value => {
+    if (!value) return '';
+    const d = new Date(value);
+    if (isNaN(d)) return escHtml(value);
+    try {
+      return escHtml(new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit', timeZone: zone
+      }).format(d));
+    } catch { return escHtml(value); }
+  };
+  const start = slot && slot.start ? format(slot.start) : 'Unknown time';
+  const end = slot && slot.end ? ' – ' + format(slot.end) : '';
+  return start + end + ' (' + escHtml(zone) + ')';
+}
+
+async function loadCalendar() {
+  const statusEl = document.getElementById('calendar-status');
+  const startEl = document.getElementById('calendar-start');
+  const endEl = document.getElementById('calendar-end');
+  if (!startEl.value) startEl.value = calendarDate(1);
+  if (!endEl.value) endEl.value = calendarDate(7);
+  const previousProspect = document.getElementById('calendar-prospect').value;
+  const [status, prospects, operations] = await Promise.all([
+    api('/api/calendar/status'),
+    api('/api/calendar/eligible-prospects'),
+    api('/api/calendar/operations'),
+  ]);
+  if (!status) {
+    statusEl.innerHTML = offlineState();
+    return;
+  }
+  _calendarStatus = status;
+  if (status.error) {
+    statusEl.innerHTML = '<div class="banner bad">' + icon('alert') +
+      '<div><b>Calendar status unavailable</b><p>' + escHtml(status.error) + '</p></div></div>';
+  } else {
+    statusEl.innerHTML = '<div class="banner ' + (status.booking_enabled ? 'good' : 'wait') + '">' +
+      icon(status.booking_enabled ? 'check' : 'alert') + '<div><b>Cal.com ' +
+      (status.configured ? 'configured' : 'not configured') + '</b><p>' +
+      escHtml(status.note || '') + (status.configured ? '' :
+      ' Add CALCOM_API_KEY and CALCOM_EVENT_TYPE_ID to .env, then restart Harvey.') +
+      '</p></div></div>';
+  }
+
+  if (prospects && Array.isArray(prospects.prospects)) {
+    _calendarProspects = prospects.prospects;
+    const select = document.getElementById('calendar-prospect');
+    select.innerHTML = '<option value="">Select a positive conversation…</option>' +
+      _calendarProspects.map(p => {
+        const name = [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email;
+        const label = name + ' — ' + (p.company_name || 'Unknown company') + ' (' + p.email + ')';
+        return '<option value="' + escHtml(p.id) + '">' + escHtml(label) + '</option>';
+      }).join('');
+    if (_calendarProspects.some(p => p.id === previousProspect)) select.value = previousProspect;
+  } else {
+    document.getElementById('calendar-prospect').innerHTML =
+      '<option value="">Could not load eligible contacts</option>';
+  }
+  if (operations && Array.isArray(operations.operations)) {
+    calendarRenderOperations(operations.operations);
+  } else {
+    document.getElementById('calendar-operations').innerHTML =
+      emptyState(icon('alert'), 'Could not load booking requests', escHtml(failMsg(operations, 'Dashboard API unavailable.')));
+  }
+  navCount('nav-calendar', (operations?.operations || []).filter(o => o.status === 'pending_review').length);
+  calendarRenderSelectedSlot();
+}
+
+async function calendarTestConnection() {
+  const data = await api('/api/calendar/test-connection', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
+  });
+  if (data && data.success) showToast(data.detail || 'Cal.com read-only test passed.', 'success');
+  else showToast(failMsg(data, 'Cal.com connection test failed.'), 'error');
+}
+
+async function calendarLoadSlots() {
+  const target = document.getElementById('calendar-slots');
+  const start = document.getElementById('calendar-start').value;
+  const end = document.getElementById('calendar-end').value;
+  const timeZone = document.getElementById('calendar-timezone').value.trim() || 'UTC';
+  const durationValue = document.getElementById('calendar-duration').value;
+  if (!start || !end) {
+    showToast('Choose both dates first.', 'error');
+    return;
+  }
+  target.innerHTML = '<div class="card">' + icon('refresh') + ' Checking Cal.com availability…</div>';
+  const body = {date_range: start + '/' + end, time_zone: timeZone};
+  if (durationValue) body.duration = Number(durationValue);
+  const data = await api('/api/calendar/slots', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  if (!data || data.error) {
+    target.innerHTML = emptyState(icon('alert'), 'Could not read availability',
+      escHtml(failMsg(data, 'Cal.com did not respond. Configure the integration and try again.')));
+    return;
+  }
+  _calendarSlots = data.slots || [];
+  _calendarSelectedSlot = null;
+  if (!_calendarSlots.length) {
+    target.innerHTML = emptyState(icon('calendar'), 'No available slots returned',
+      'Try another date range. This read does not reserve a slot.');
+    calendarRenderSelectedSlot();
+    return;
+  }
+  target.innerHTML = '<div class="subhead">Available times (' + _calendarSlots.length + ')</div>' +
+    '<div class="queue">' + _calendarSlots.map((slot, i) =>
+      '<div class="queue-item"><div class="qtext"><div class="qtitle">' +
+      calendarSlotLabel(slot) + '</div><div class="qdetail">Not reserved</div></div>' +
+      '<button class="btn btn-secondary btn-sm" onclick="calendarSelectSlot(' + i + ')">Select</button></div>'
+    ).join('') + '</div>';
+}
+
+function calendarSelectSlot(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= _calendarSlots.length) return;
+  _calendarSelectedSlot = _calendarSlots[index];
+  calendarRenderSelectedSlot();
+}
+
+function calendarRenderSelectedSlot() {
+  const el = document.getElementById('calendar-selected-slot');
+  const btn = document.getElementById('calendar-stage');
+  if (!el || !btn) return;
+  if (!_calendarSelectedSlot) {
+    el.className = 'banner wait';
+    el.innerHTML = '<div>Select a time slot above first. It will still need human approval.</div>';
+    btn.disabled = true;
+    return;
+  }
+  el.className = 'banner good';
+  el.innerHTML = '<div><b>Selected time</b><p>' + calendarSlotLabel(_calendarSelectedSlot) +
+    '</p><p>This is a choice, not a reservation. You will review the attendee and approve the booking separately.</p></div>';
+  btn.disabled = !_calendarStatus.configured;
+}
+
+async function calendarStageBooking() {
+  const prospectId = document.getElementById('calendar-prospect').value;
+  if (!prospectId || !_calendarSelectedSlot) {
+    showToast('Select an eligible contact and an availability slot.', 'error');
+    return;
+  }
+  const data = await api('/api/calendar/booking-requests', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      prospect_id: prospectId,
+      start: _calendarSelectedSlot.start,
+      end: _calendarSelectedSlot.end || '',
+      time_zone: document.getElementById('calendar-timezone').value.trim() || 'UTC'
+    })
+  });
+  if (data && data.success) {
+    showToast('Booking request staged for human review. No booking has been made.', 'success');
+    _calendarSelectedSlot = null;
+    await loadCalendar();
+  } else {
+    showToast(failMsg(data, 'Could not stage the booking request.'), 'error');
+  }
+}
+
+function calendarRenderOperations(items) {
+  const el = document.getElementById('calendar-operations');
+  if (!el) return;
+  if (!items.length) {
+    el.innerHTML = emptyState(icon('calendar'), 'No booking requests',
+      'A request appears here only after you select an eligible contact and a returned slot.');
+    return;
+  }
+  const sorted = [...items].sort((a,b) => {
+    const order = {pending_review:0, approved:1, executing:2, unknown:3, confirmed:4, failed:5, rejected:6, cancelled:7};
+    return (order[a.status] ?? 8) - (order[b.status] ?? 8) ||
+      String(b.created_at || '').localeCompare(String(a.created_at || ''));
+  });
+  el.innerHTML = sorted.map(op => {
+    const p = op.payload || {};
+    const attendee = p.attendee || {};
+    const slot = {start:p.start};
+    const actionButtons = op.status === 'pending_review'
+      ? '<button class="btn btn-primary btn-sm" onclick="calendarApprove(' + jsq(op.id) + ')">Approve</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="calendarReject(' + jsq(op.id) + ')">Reject</button>'
+      : op.status === 'approved'
+        ? '<button class="btn btn-primary btn-sm" ' + (_calendarStatus.booking_enabled ? '' : 'disabled title="Live booking is disabled until validated"') +
+          ' onclick="calendarExecute(' + jsq(op.id) + ')">Execute booking</button>'
+      : op.status === 'unknown'
+        ? '<details><summary>Reconcile with provider evidence</summary>' +
+          '<div class="form-group"><label class="form-label">Booking ID or UID</label><input class="form-input" id="cal-rec-id-' + escHtml(op.id) + '" placeholder="Required to confirm booking"></div>' +
+          '<div class="form-group"><label class="form-label">What did you verify?</label><input class="form-input" id="cal-rec-note-' + escHtml(op.id) + '" placeholder="Checked Cal.com bookings list"></div>' +
+          '<div class="btn-group"><button class="btn btn-primary btn-sm" onclick="calendarReconcile(' + jsq(op.id) + ', ' + jsq('confirmed') + ')">Confirm booked</button>' +
+          '<button class="btn btn-secondary btn-sm" onclick="calendarReconcile(' + jsq(op.id) + ', ' + jsq('failed') + ')">Confirm not booked</button></div></details>'
+      : '';
+    const result = op.result || {};
+    return '<div class="card" style="margin-bottom:12px"><div class="row-between"><b>' +
+      escHtml(attendee.name || 'Calendar request') + '</b>' + badge(op.status) + '</div>' +
+      '<p class="lede">' + escHtml(attendee.email || '') + '</p>' +
+      '<p>' + calendarSlotLabel(slot) + '</p>' +
+      '<div class="small muted">Created ' + escHtml(formatDate(op.created_at)) +
+      (op.approved_by ? ' · Approved by ' + escHtml(op.approved_by) : '') + '</div>' +
+      (op.error ? '<div class="banner ' + (op.status === 'unknown' ? 'wait' : 'bad') + '"><div>' + escHtml(op.error) + '</div></div>' : '') +
+      (result.uid || op.provider_uid ? '<p><b>Provider UID:</b> ' + escHtml(result.uid || op.provider_uid) + '</p>' : '') +
+      (result.id || op.provider_booking_id ? '<p><b>Provider booking ID:</b> ' + escHtml(result.id || op.provider_booking_id) + '</p>' : '') +
+      (op.status === 'approved' && !_calendarStatus.booking_enabled ? '<p class="muted">Execution is disabled by CALENDAR_BOOKING_ENABLED=false or missing credentials.</p>' : '') +
+      (actionButtons ? '<div class="btn-group" style="margin-top:12px">' + actionButtons + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+async function calendarOperationAction(operationId, action, body) {
+  const data = await api('/api/calendar/operations/' + encodeURIComponent(operationId) + '/' + action, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body || {})
+  });
+  if (data && (data.success || data.operation)) {
+    const status = data.operation?.status || 'updated';
+    const failed = status === 'unknown' || status === 'failed';
+    showToast(action === 'execute' && status === 'unknown'
+      ? 'Booking outcome is unknown. Reconcile it before taking further action.'
+      : 'Calendar operation status: ' + status,
+      failed ? 'error' : 'success');
+    await loadCalendar();
+  } else {
+    showToast(failMsg(data, 'Calendar operation failed.'), 'error');
+  }
+}
+
+async function calendarApprove(id) {
+  if (!confirm('Approve this exact attendee and time? This does not create the booking yet.')) return;
+  await calendarOperationAction(id, 'approve', {approved_by:'you'});
+}
+
+async function calendarReject(id) {
+  if (!confirm('Reject this booking request? No provider booking will be created.')) return;
+  await calendarOperationAction(id, 'reject', {rejected_by:'you', reason:'Rejected in calendar dashboard'});
+}
+
+async function calendarExecute(id) {
+  if (!_calendarStatus.booking_enabled) {
+    showToast('Live booking is disabled. Keep it disabled until CI and sandbox validation pass.', 'error');
+    return;
+  }
+  if (!confirm('Create this real Cal.com booking now? The approval will be consumed once; uncertain outcomes are not retried automatically.')) return;
+  await calendarOperationAction(id, 'execute', {});
+}
+
+async function calendarReconcile(id, outcome) {
+  const providerId = document.getElementById('cal-rec-id-' + id)?.value.trim() || '';
+  const note = document.getElementById('cal-rec-note-' + id)?.value.trim() || '';
+  if (outcome === 'confirmed' && !providerId) {
+    showToast('Enter the Cal.com booking ID or UID before confirming.', 'error');
+    return;
+  }
+  if (note.length < 8) {
+    showToast('Add a note describing the evidence you checked.', 'error');
+    return;
+  }
+  if (!confirm('Record the manually verified outcome as ' + outcome + '? This will not call Cal.com.')) return;
+  await calendarOperationAction(id, 'reconcile', {
+    outcome, provider_booking_id: providerId, provider_uid: providerId, note
+  });
+}
+
+
 // ── Init & live refresh ──
 
 loadToday();
@@ -2609,6 +2887,15 @@ setInterval(() => {
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
+    case 'calendar': {
+      api('/api/calendar/operations').then(data => {
+        if (currentTab === 'calendar' && data && Array.isArray(data.operations)) {
+          calendarRenderOperations(data.operations);
+          navCount('nav-calendar', data.operations.filter(o => o.status === 'pending_review').length);
+        }
+      });
+      break;
+    }
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'controls': loadLogs(); break;

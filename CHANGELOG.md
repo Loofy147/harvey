@@ -9,6 +9,8 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Cal.com adapter and dashboard approval workflow.** Adds bounded availability reads, preserves the selected slot duration, and stages bookings in a durable operation ledger. Human approval is atomically bound to a canonical payload hash and consumed once. The dashboard supports staging, review, rejection, execution and manual reconciliation of unknown outcomes. Booking writes remain disabled by default with `CALENDAR_BOOKING_ENABLED=false`; full repository CI and a Cal.com sandbox smoke test are still required before enabling live bookings. Cancellation/rescheduling and automatic meeting-intent triggers remain follow-up work.
+
 - **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
   listings around each city, with phone, website, category, rating and review
   count, and Google organic results with rank, both from one

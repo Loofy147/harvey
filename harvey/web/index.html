@@ -22,6 +22,7 @@
     <symbol id="i-campaigns" viewBox="0 0 24 24"><path d="M21 3 10 14"/><path d="M21 3 14.5 21l-4.5-7-7-4.5z"/></symbol>
     <symbol id="i-outbox" viewBox="0 0 24 24"><path d="M3 13h5l1.5 3h5l1.5-3h5"/><path d="M5.5 5h13L21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6z"/></symbol>
     <symbol id="i-conversations" viewBox="0 0 24 24"><path d="M20 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M8 14h3M8 17h6"/></symbol>
     <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
     <symbol id="i-usage" viewBox="0 0 24 24"><path d="M5 20v-8M12 20V5M19 20v-5"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
@@ -73,6 +74,7 @@
       <button class="active" onclick="showTab('today', this)"><svg class="icon" aria-hidden="true"><use href="#i-today"/></svg><span class="label">Today</span><span class="nav-count" id="nav-today"></span></button>
       <button onclick="showTab('outbox', this)"><svg class="icon" aria-hidden="true"><use href="#i-outbox"/></svg><span class="label">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
       <button onclick="showTab('conversations', this)"><svg class="icon" aria-hidden="true"><use href="#i-conversations"/></svg><span class="label">Conversations</span><span class="nav-count" id="nav-conversations"></span></button>
+      <button onclick="showTab('calendar', this)"><svg class="icon" aria-hidden="true"><use href="#i-calendar"/></svg><span class="label">Calendar</span><span class="nav-count" id="nav-calendar"></span></button>
     </div>
     <div class="nav-group">
       <div class="nav-label">Pipeline</div>
@@ -261,6 +263,70 @@
   <div id="outbox-banner"></div>
   <div id="outbox-desk"></div>
   <div id="outbox-list"></div>
+</div>
+
+<!-- Calendar: availability, human approval and booking outcomes -->
+<div id="calendar" class="section">
+  <div class="section-head">
+    <div>
+      <h2>Calendar</h2>
+      <p>Read availability, stage a booking for review, then execute only after a human approves it. An available slot is not reserved.</p>
+    </div>
+    <div class="page-actions">
+      <button class="btn btn-secondary btn-sm" onclick="calendarTestConnection()">Test Cal.com</button>
+      <button class="btn btn-secondary btn-sm" onclick="loadCalendar()">Refresh</button>
+    </div>
+  </div>
+  <div id="calendar-status"></div>
+  <div class="grid-main">
+    <div>
+      <div class="card">
+        <div class="subhead">Find availability</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="calendar-start">From</label>
+            <input class="form-input" id="calendar-start" type="date">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="calendar-end">Through</label>
+            <input class="form-input" id="calendar-end" type="date">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group" style="flex:2">
+            <label class="form-label" for="calendar-timezone">Time zone (IANA)</label>
+            <input class="form-input" id="calendar-timezone" value="Africa/Algiers" placeholder="Africa/Algiers">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="calendar-duration">Duration (minutes)</label>
+            <select class="form-input" id="calendar-duration">
+              <option value="">Event default</option><option>15</option><option selected>30</option><option>45</option><option>60</option>
+            </select>
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="calendarLoadSlots()">Find slots</button>
+        </div>
+        <div id="calendar-slots" style="margin-top:16px"></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="subhead">Request a meeting</div>
+        <p class="lede">Only contacts with an open, positive conversation appear here. Requesting a meeting does not call Cal.com or send email.</p>
+        <div class="form-group">
+          <label class="form-label" for="calendar-prospect">Contact</label>
+          <select class="form-input" id="calendar-prospect"><option value="">Loading eligible contacts…</option></select>
+        </div>
+        <div id="calendar-selected-slot" class="banner wait"><div>Select a time slot above first.</div></div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="calendar-stage" onclick="calendarStageBooking()" disabled>Request booking approval</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="subhead">Booking review and outcomes</div>
+      <div id="calendar-operations"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Conversations -->
