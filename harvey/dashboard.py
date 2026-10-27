@@ -1008,6 +1008,315 @@ async def _with_context(items: list[dict]) -> list[dict]:
     return items
 
 
+async def _calendar_booking_preflight(state, operation):
+    """Recheck live eligibility immediately before any Cal.com booking POST."""
+    from harvey.gate import do_not_contact_match
+
+    context = operation.get("context") or {}
+    prospect_id = str(context.get("prospect_id") or "")
+    if not prospect_id:
+        return "Booking request is missing its prospect reference; no provider request was attempted."
+    prospect = await state.get_prospect(prospect_id)
+    if not prospect:
+        return "Contact no longer exists; no provider request was attempted."
+    blocked = {"opted_out", "not_interested", "bounced", "closed", "lost", "meeting"}
+    if str(prospect.status or "").strip().lower() in blocked:
+        return "Contact status changed and no longer permits meeting booking."
+    payload = operation.get("payload") or {}
+    attendee = payload.get("attendee") or {}
+    approved_email = str(attendee.get("email") or "").strip().lower()
+    current_email = str(prospect.email or "").strip().lower()
+    if not current_email or current_email != approved_email:
+        return "Contact email changed after approval; stage and review a new booking request."
+    entries = await _calendar_dnc_entries()
+    if do_not_contact_match(current_email, entries) or do_not_contact_match(approved_email, entries):
+        return "Contact is now on the do-not-contact list; booking was cancelled."
+    positive = await query_db(
+        """SELECT 1 FROM conversations WHERE prospect_id = ?
+           AND lower(COALESCE(status, '')) NOT IN ('closed','meeting_booked')
+           AND (lower(COALESCE(intent, '')) = 'interested'
+                OR lower(COALESCE(stage, '')) IN ('engaged','closing'))
+           LIMIT 1""", (prospect_id,),
+    )
+    if not positive:
+        return "No positive open conversation remains; booking was cancelled."
+    return True
+
+
+def _calendar_service(state):
+    """Build the provider adapter with durable approvals and live policy rechecks."""
+    from dotenv import load_dotenv
+    from harvey.integrations.calendar import CalendarClient
+    from harvey.integrations.calendar_service import CalendarService
+
+    load_dotenv(ENV_FILE, override=True)
+    client = CalendarClient(approval_verifier=state.verify_and_consume_calendar_approval)
+    return CalendarService(
+        state, client, booking_preflight=lambda operation: _calendar_booking_preflight(state, operation)
+    )
+
+
+async def _calendar_dnc_entries():
+    from harvey.config import load_config, live_do_not_contact
+    config = load_config(str(_resolve_config_file()))
+    return live_do_not_contact(config)
+
+
+@app.get("/api/calendar/status")
+async def calendar_status():
+    """Read configuration state only; network access requires an explicit test."""
+    try:
+        state = _state()
+        await state.init_db()
+        service = _calendar_service(state)
+        ok, _ = service.client.is_configured(), ""
+        return {
+            "configured": bool(ok),
+            "booking_enabled": bool(service.booking_enabled and ok),
+            "provider": "cal.com",
+            "note": (
+                "Booking enabled. Keep it off until sandbox smoke tests and CI pass."
+                if service.booking_enabled and ok else
+                "Availability is read-only. Booking is disabled by default or credentials are incomplete."
+            ),
+        }
+    except Exception as exc:
+        logger.exception("calendar status failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/test-connection")
+async def calendar_test_connection():
+    """Explicit read-only provider test; does not create a booking."""
+    try:
+        state = _state()
+        await state.init_db()
+        service = _calendar_service(state)
+        ok, detail = await service.client.test_connection()
+        return {"success": bool(ok), "detail": detail}
+    except Exception as exc:
+        logger.exception("calendar test connection failed")
+        return JSONResponse({"success": False, "message": str(exc)[:300]}, status_code=502)
+
+
+@app.get("/api/calendar/eligible-prospects")
+async def calendar_eligible_prospects():
+    """Only surface contacts with a positive, still-open sales conversation."""
+    try:
+        state = _state()
+        await state.init_db()
+        rows = await query_db(
+            """SELECT DISTINCT p.id, p.first_name, p.last_name, p.email, p.status,
+                      p.title, p.timezone, COALESCE(c.name, p.company, '') AS company_name,
+                      cv.intent, cv.stage, cv.updated_at AS engagement_updated_at
+               FROM prospects p
+               JOIN conversations cv ON cv.prospect_id = p.id
+               LEFT JOIN companies c ON c.id = p.company_id
+               WHERE p.email != ''
+                 AND lower(COALESCE(p.status, '')) NOT IN
+                     ('opted_out','not_interested','bounced','closed','lost','meeting')
+                 AND lower(COALESCE(cv.status, '')) NOT IN ('closed','meeting_booked')
+                 AND (lower(COALESCE(cv.intent, '')) = 'interested'
+                      OR lower(COALESCE(cv.stage, '')) IN ('engaged','closing'))
+               ORDER BY cv.updated_at DESC LIMIT 200"""
+        )
+        from harvey.gate import do_not_contact_match
+        entries = await _calendar_dnc_entries()
+        eligible = [row for row in rows
+                    if not do_not_contact_match(str(row.get("email") or ""), entries)]
+        return {"prospects": eligible}
+    except Exception as exc:
+        logger.exception("calendar eligible prospects failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/slots")
+async def calendar_slots(request: Request):
+    """Read available slots; returned slots are not holds or reservations."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    date_range = str(body.get("date_range") or "").strip()
+    time_zone = str(body.get("time_zone") or "UTC").strip()
+    duration = body.get("duration")
+    if duration in ("", None):
+        duration = None
+    try:
+        state = _state()
+        await state.init_db()
+        service = _calendar_service(state)
+        slots = await service.client.get_available_slots(date_range, time_zone=time_zone, duration=duration)
+        return {"slots": slots, "is_hold": False, "note": "Availability can change before booking."}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("calendar availability lookup failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=502)
+
+
+@app.get("/api/calendar/operations")
+async def calendar_operations(status: str | None = None, limit: int = 50):
+    try:
+        state = _state()
+        await state.init_db()
+        service = _calendar_service(state)
+        items = await service.list_operations(status=status, limit=limit)
+        return {"operations": items}
+    except Exception as exc:
+        logger.exception("calendar operations list failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/booking-requests")
+async def calendar_stage_booking(request: Request):
+    """Stage a booking for review only; no Cal.com POST occurs here."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    prospect_id = str(body.get("prospect_id") or "").strip()
+    start = str(body.get("start") or "").strip()
+    time_zone = str(body.get("time_zone") or "UTC").strip()
+    if not prospect_id or not start:
+        return JSONResponse({"error": "prospect_id and selected slot start are required."}, status_code=400)
+    try:
+        state = _state()
+        await state.init_db()
+        prospect = await state.get_prospect(prospect_id)
+        if not prospect:
+            return JSONResponse({"error": "Contact not found."}, status_code=404)
+        if str(prospect.status or "").strip().lower() in {"opted_out", "not_interested", "bounced", "closed", "lost", "meeting"}:
+            return JSONResponse({"error": "This contact's current status blocks booking."}, status_code=409)
+        positive = await query_db(
+            """SELECT 1 FROM conversations WHERE prospect_id = ?
+               AND lower(COALESCE(status, '')) NOT IN ('closed','meeting_booked')
+               AND (lower(COALESCE(intent, '')) = 'interested'
+                    OR lower(COALESCE(stage, '')) IN ('engaged','closing'))
+               LIMIT 1""", (prospect_id,),
+        )
+        if not positive:
+            return JSONResponse({"error": "A positive, open conversation is required before booking."}, status_code=409)
+        from harvey.gate import do_not_contact_match
+        entries = await _calendar_dnc_entries()
+        if do_not_contact_match(prospect.email, entries):
+            return JSONResponse({"error": "This contact is on the do-not-contact list."}, status_code=409)
+        service = _calendar_service(state)
+        operation = await service.stage_booking(
+            prospect_email=prospect.email,
+            prospect_name=prospect.full_name(),
+            slot={"start": start, "end": str(body.get("end") or "")},
+            time_zone=time_zone,
+            requested_by="dashboard",
+            context={"prospect_id": prospect_id},
+        )
+        return JSONResponse({"success": True, "operation": operation}, status_code=201)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("calendar booking staging failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/operations/{operation_id}/approve")
+async def calendar_approve(operation_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        state = _state()
+        await state.init_db()
+        operation = await _calendar_service(state).approve(
+            operation_id, "local_operator",
+        )
+        return {"success": True, "operation": operation}
+    except Exception as exc:
+        from harvey.integrations.calendar_service import CalendarWorkflowError
+        if isinstance(exc, CalendarWorkflowError):
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        logger.exception("calendar approval failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/operations/{operation_id}/reject")
+async def calendar_reject(operation_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        state = _state()
+        await state.init_db()
+        operation = await _calendar_service(state).reject(
+            operation_id, "local_operator",
+            str(body.get("reason") or "Rejected in dashboard"),
+        )
+        return {"success": True, "operation": operation}
+    except Exception as exc:
+        from harvey.integrations.calendar_service import CalendarWorkflowError
+        if isinstance(exc, CalendarWorkflowError):
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        logger.exception("calendar rejection failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/operations/{operation_id}/execute")
+async def calendar_execute(operation_id: str):
+    try:
+        state = _state()
+        await state.init_db()
+        operation = await _calendar_service(state).execute_approved(operation_id)
+        return {"success": operation.get("status") == "confirmed", "operation": operation}
+    except Exception as exc:
+        from harvey.integrations.calendar_service import CalendarWorkflowError
+        from harvey.integrations.calendar import CalendarApprovalRequired
+        if isinstance(exc, (CalendarWorkflowError, CalendarApprovalRequired)):
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        logger.exception("calendar execution failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/calendar/operations/{operation_id}/reconcile")
+async def calendar_reconcile(operation_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    outcome = str(body.get("outcome") or "").strip()
+    provider_booking_id = str(body.get("provider_booking_id") or "").strip()
+    provider_uid = str(body.get("provider_uid") or "").strip()
+    note = str(body.get("note") or "").strip()
+    if outcome == "confirmed" and not (provider_booking_id or provider_uid):
+        return JSONResponse({"error": "Provide the provider booking ID or UID as evidence."}, status_code=400)
+    try:
+        state = _state()
+        await state.init_db()
+        operation = await _calendar_service(state).reconcile(
+            operation_id, outcome=outcome, note=note,
+            provider_booking_id=provider_booking_id, provider_uid=provider_uid,
+        )
+        return {"success": True, "operation": operation}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        from harvey.integrations.calendar_service import CalendarWorkflowError
+        if isinstance(exc, CalendarWorkflowError):
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        logger.exception("calendar reconciliation failed")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""

@@ -9,6 +9,7 @@ list tracked with SQLite's ``PRAGMA user_version`` so existing user DBs
 upgrade cleanly in place.
 """
 
+import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -519,6 +520,52 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: durable, one-time approval and operation ledger for calendar writes ──
+    """
+    CREATE TABLE IF NOT EXISTS calendar_operations (
+        id TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_review'
+            CHECK (status IN ('pending_review','approved','executing','confirmed',
+                              'failed','unknown','rejected','cancelled')),
+        approval_ref TEXT NOT NULL UNIQUE,
+        requested_by TEXT DEFAULT '',
+        approved_by TEXT DEFAULT '',
+        result_json TEXT DEFAULT '{}',
+        provider_booking_id TEXT DEFAULT '',
+        provider_uid TEXT DEFAULT '',
+        error TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS calendar_approvals (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE,
+        action TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','approved','consumed','rejected','expired')),
+        approved_by TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT,
+        consumed_at TEXT,
+        FOREIGN KEY (operation_id) REFERENCES calendar_operations(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_calendar_ops_status_created
+        ON calendar_operations(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_calendar_approvals_status_expiry
+        ON calendar_approvals(status, expires_at);
+    """,
+    # ── v16: retained context for calendar-time policy rechecks ──
+    """
+    ALTER TABLE calendar_operations ADD COLUMN context_json TEXT DEFAULT '{}';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -582,6 +629,418 @@ class StateManager:
                     await db.executescript(script)
                     await db.execute(f"PRAGMA user_version = {target}")
                     await db.commit()
+
+
+    # ── Calendar booking approvals and durable operation ledger ──
+
+    @staticmethod
+    def _calendar_operation_from_row(row) -> dict:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        try:
+            context = json.loads(item.get("context_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+        try:
+            result = json.loads(item.get("result_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            result = {}
+        item["payload"] = payload if isinstance(payload, dict) else {}
+        item["context"] = context if isinstance(context, dict) else {}
+        item["result"] = result if isinstance(result, dict) else {}
+        item.pop("payload_json", None)
+        item.pop("context_json", None)
+        item.pop("result_json", None)
+        return item
+
+    async def create_calendar_operation(
+        self, *, action: str, payload: dict, payload_hash: str,
+        requested_by: str = "dashboard", context: dict | None = None,
+        approval_ttl_minutes: int = 60,
+    ) -> dict:
+        """Stage a calendar write for review. Staging never calls a provider."""
+        if action != "calendar.book":
+            raise ValueError("Unsupported calendar action.")
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError("Calendar booking payload must be a non-empty object.")
+        if (not isinstance(payload_hash, str) or len(payload_hash) != 64
+                or any(ch not in "0123456789abcdef" for ch in payload_hash)):
+            raise ValueError("payload_hash must be a lowercase SHA-256 digest.")
+        try:
+            canonical_payload = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise ValueError("Calendar booking payload must be JSON-serializable.") from None
+        if hashlib.sha256(canonical_payload).hexdigest() != payload_hash:
+            raise ValueError("payload_hash does not match the canonical booking payload.")
+        if isinstance(approval_ttl_minutes, bool) or not isinstance(approval_ttl_minutes, int) \
+                or not 1 <= approval_ttl_minutes <= 1440:
+            raise ValueError("approval_ttl_minutes must be from 1 to 1440.")
+        operation_id = uuid.uuid4().hex
+        approval_ref = uuid.uuid4().hex
+        now = _utcnow()
+        expires = now + timedelta(minutes=approval_ttl_minutes)
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        context = context if isinstance(context, dict) else {}
+        context_json = json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """INSERT INTO calendar_operations
+                   (id, action, payload_json, context_json, payload_hash, status, approval_ref,
+                    requested_by, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending_review', ?, ?, ?, ?)""",
+                (operation_id, action, payload_json, context_json, payload_hash, approval_ref,
+                 str(requested_by or "dashboard")[:120], now.isoformat(), now.isoformat()),
+            )
+            await db.execute(
+                """INSERT INTO calendar_approvals
+                   (id, operation_id, action, payload_hash, status, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (approval_ref, operation_id, action, payload_hash,
+                 now.isoformat(), expires.isoformat()),
+            )
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_staged", "dashboard",
+                 json.dumps({"operation_id": operation_id, "approval_ref": approval_ref,
+                             "action": action, "payload_hash": payload_hash})),
+            )
+            await db.commit()
+        return await self.get_calendar_operation(operation_id)
+
+    async def get_calendar_operation(self, operation_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM calendar_operations WHERE id = ?", (operation_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        return self._calendar_operation_from_row(row) if row else None
+
+    async def list_calendar_operations(
+        self, status: str | None = None, limit: int = 50,
+    ) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                async with db.execute(
+                    "SELECT * FROM calendar_operations WHERE status = ? "
+                    "ORDER BY created_at DESC LIMIT ?", (status, limit)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+            else:
+                async with db.execute(
+                    "SELECT * FROM calendar_operations ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+        return [self._calendar_operation_from_row(row) for row in rows]
+
+    async def approve_calendar_operation(
+        self, operation_id: str, approved_by: str = "you",
+    ) -> bool:
+        """Approve one staged operation atomically; never calls Cal.com."""
+        actor = str(approved_by or "").strip()[:120]
+        if not actor:
+            raise ValueError("approved_by is required.")
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT approval_ref FROM calendar_operations "
+                "WHERE id = ? AND status = 'pending_review'", (operation_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            approval_ref = row[0]
+            async with db.execute(
+                "SELECT 1 FROM calendar_approvals WHERE id = ? AND status = 'pending' "
+                "AND expires_at > ?", (approval_ref, now)
+            ) as cursor:
+                valid = await cursor.fetchone()
+            if not valid:
+                await db.rollback()
+                return False
+            op = await db.execute(
+                "UPDATE calendar_operations SET status = 'approved', approved_by = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'pending_review'",
+                (actor, now, operation_id),
+            )
+            ap = await db.execute(
+                "UPDATE calendar_approvals SET status = 'approved', approved_by = ?, "
+                "approved_at = ? WHERE id = ? AND status = 'pending' AND expires_at > ?",
+                (actor, now, approval_ref, now),
+            )
+            if op.rowcount != 1 or ap.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_approved", "dashboard",
+                 json.dumps({"operation_id": operation_id, "approval_ref": approval_ref,
+                             "approved_by": actor})),
+            )
+            await db.commit()
+        return True
+
+    async def reject_calendar_operation(
+        self, operation_id: str, rejected_by: str = "you", reason: str = "",
+    ) -> bool:
+        """Reject a pending calendar operation; no provider call is made."""
+        actor = str(rejected_by or "").strip()[:120]
+        note = str(reason or "").strip()[:500]
+        if not actor:
+            raise ValueError("rejected_by is required.")
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT approval_ref FROM calendar_operations "
+                "WHERE id = ? AND status = 'pending_review'", (operation_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            approval_ref = row[0]
+            op = await db.execute(
+                "UPDATE calendar_operations SET status = 'rejected', error = ?, updated_at = ?, "
+                "completed_at = ? WHERE id = ? AND status = 'pending_review'",
+                (note, now, now, operation_id),
+            )
+            ap = await db.execute(
+                "UPDATE calendar_approvals SET status = 'rejected' "
+                "WHERE id = ? AND status = 'pending'", (approval_ref,),
+            )
+            if op.rowcount != 1 or ap.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_rejected", "dashboard",
+                 json.dumps({"operation_id": operation_id, "approval_ref": approval_ref,
+                             "rejected_by": actor, "reason": note})),
+            )
+            await db.commit()
+        return True
+
+    async def verify_and_consume_calendar_approval(
+        self, approval_ref: str, action: str, payload_hash: str,
+    ) -> bool:
+        """Atomically consume a matching, unexpired approval exactly once."""
+        now = _utcnow().isoformat()
+        if not approval_ref or action != "calendar.book":
+            return False
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                """SELECT operation_id FROM calendar_approvals
+                   WHERE id = ? AND action = ? AND payload_hash = ?
+                     AND status = 'approved' AND expires_at > ?""",
+                (approval_ref, action, payload_hash, now),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            operation_id = row[0]
+            approval = await db.execute(
+                "UPDATE calendar_approvals SET status = 'consumed', consumed_at = ? "
+                "WHERE id = ? AND status = 'approved' AND expires_at > ?",
+                (now, approval_ref, now),
+            )
+            operation = await db.execute(
+                "UPDATE calendar_operations SET status = 'executing', updated_at = ? "
+                "WHERE id = ? AND status = 'approved' AND approval_ref = ? "
+                "AND payload_hash = ?",
+                (now, operation_id, approval_ref, payload_hash),
+            )
+            if approval.rowcount != 1 or operation.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_started", "calendar",
+                 json.dumps({"operation_id": operation_id, "approval_ref": approval_ref,
+                             "action": action, "payload_hash": payload_hash})),
+            )
+            await db.commit()
+        return True
+
+    async def cancel_approved_calendar_operation(
+        self, operation_id: str, reason: str,
+    ) -> bool:
+        """Cancel a booking before provider I/O when its live policy no longer permits it."""
+        safe_reason = str(reason or "Booking preflight rejected the operation.").replace("\x00", "")[:1000]
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT approval_ref FROM calendar_operations "
+                "WHERE id = ? AND status = 'approved'", (operation_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            approval_ref = row[0]
+            op = await db.execute(
+                "UPDATE calendar_operations SET status = 'cancelled', error = ?, "
+                "updated_at = ?, completed_at = ? WHERE id = ? AND status = 'approved'",
+                (safe_reason, now, now, operation_id),
+            )
+            ap = await db.execute(
+                "UPDATE calendar_approvals SET status = 'rejected' "
+                "WHERE id = ? AND status = 'approved'", (approval_ref,),
+            )
+            if op.rowcount != 1 or ap.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_cancelled_preflight", "calendar",
+                 json.dumps({"operation_id": operation_id, "approval_ref": approval_ref,
+                             "reason": safe_reason})),
+            )
+            await db.commit()
+        return True
+
+    async def complete_calendar_operation(
+        self, operation_id: str, *, status: str, result: dict | None = None,
+        error: str = "",
+    ) -> bool:
+        """Finish a claimed operation. Unknown outcomes are never auto-retried."""
+        allowed = {"confirmed", "failed", "unknown"}
+        if status not in allowed:
+            raise ValueError(f"status must be one of {sorted(allowed)}.")
+        result = result if isinstance(result, dict) else {}
+        now = _utcnow().isoformat()
+        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        provider_id = str(result.get("id") or "")[:200]
+        provider_uid = str(result.get("uid") or "")[:200]
+        safe_error = str(error or "").replace("\x00", "")[:1000]
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """UPDATE calendar_operations
+                   SET status = ?, result_json = ?, provider_booking_id = ?,
+                       provider_uid = ?, error = ?, updated_at = ?, completed_at = ?
+                   WHERE id = ? AND status = 'executing'""",
+                (status, result_json, provider_id, provider_uid, safe_error, now, now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_" + status, "calendar",
+                 json.dumps({"operation_id": operation_id, "status": status,
+                             "provider_booking_id": provider_id, "provider_uid": provider_uid,
+                             "error": safe_error})),
+            )
+            await db.commit()
+        return True
+
+    async def expire_calendar_approvals(self) -> int:
+        """Expire pending/approved requests without treating them as provider calls."""
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT operation_id FROM calendar_approvals "
+                "WHERE status IN ('pending','approved') AND expires_at <= ?", (now,)
+            ) as cursor:
+                ids = [row[0] for row in await cursor.fetchall()]
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                await db.execute(
+                    f"UPDATE calendar_approvals SET status = 'expired' "
+                    f"WHERE operation_id IN ({marks}) AND status IN ('pending','approved')",
+                    ids,
+                )
+                await db.execute(
+                    f"UPDATE calendar_operations SET status = 'cancelled', "
+                    f"error = 'Approval expired before booking execution.', updated_at = ?, completed_at = ? "
+                    f"WHERE id IN ({marks}) AND status IN ('pending_review','approved')",
+                    (now, now, *ids),
+                )
+                await db.execute(
+                    "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                    (_new_id(), "calendar_booking_expired", "calendar",
+                     json.dumps({"operation_ids": ids})),
+                )
+            await db.commit()
+        return len(ids)
+
+    async def fail_stale_calendar_operations(self, older_than: timedelta = timedelta(minutes=5)) -> int:
+        """Convert crashed in-flight writes to unknown, never retry them blindly."""
+        cutoff = (_utcnow() - older_than).isoformat()
+        now = _utcnow().isoformat()
+        note = "Process stopped during booking; provider outcome is unknown. Reconcile before retry."
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id FROM calendar_operations WHERE status = 'executing' AND updated_at < ?",
+                (cutoff,),
+            ) as cursor:
+                ids = [row[0] for row in await cursor.fetchall()]
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                await db.execute(
+                    f"UPDATE calendar_operations SET status = 'unknown', error = ?, "
+                    f"updated_at = ?, completed_at = ? WHERE id IN ({marks}) AND status = 'executing'",
+                    (note, now, now, *ids),
+                )
+                await db.execute(
+                    "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                    (_new_id(), "calendar_booking_unknown", "calendar",
+                     json.dumps({"operation_ids": ids, "reason": "stale executing operation"})),
+                )
+            await db.commit()
+        return len(ids)
+
+    async def reconcile_calendar_operation(
+        self, operation_id: str, *, outcome: str, note: str,
+        provider_booking_id: str = "", provider_uid: str = "",
+    ) -> bool:
+        """Record a human-verified outcome for an ambiguous booking."""
+        if outcome not in {"confirmed", "failed"}:
+            raise ValueError("outcome must be confirmed or failed.")
+        note = str(note or "").strip()[:1000]
+        if len(note) < 8:
+            raise ValueError("Reconciliation note must explain the evidence (at least 8 characters).")
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """UPDATE calendar_operations
+                   SET status = ?, error = ?, provider_booking_id = ?, provider_uid = ?,
+                       updated_at = ?, completed_at = ?
+                   WHERE id = ? AND status = 'unknown'""",
+                (outcome, "Reconciled by operator: " + note,
+                 str(provider_booking_id or "")[:200], str(provider_uid or "")[:200],
+                 now, now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "calendar_booking_reconciled", "dashboard",
+                 json.dumps({"operation_id": operation_id, "outcome": outcome,
+                             "note": note, "provider_booking_id": str(provider_booking_id or "")[:200],
+                             "provider_uid": str(provider_uid or "")[:200]})),
+            )
+            await db.commit()
+        return True
 
     # ── Companies ──
 

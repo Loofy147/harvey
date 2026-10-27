@@ -1,0 +1,38 @@
+manifest_version: "1"
+id: calendar.calcom
+version: 0.1.0
+display_name: Cal.com calendar
+summary: Read bookable slots and create bookings only after durable human approval.
+entrypoint: harvey.integrations.calendar:CalendarClient
+capabilities:
+  - id: calendar.availability.read
+    mode: read
+    description: Read open event slots in a bounded date range.
+    approval: never
+  - id: calendar.book
+    mode: write
+    description: Create a meeting after Harvey verifies a durable approval reference.
+    approval: required
+permissions:
+  - calendar.availability.read
+  - calendar.book
+data_access:
+  reads: [business, personal]
+  writes: [business, personal]
+  retention_days: null
+  sends_to_vendor: [api.cal.com]
+network:
+  https_hosts: [api.cal.com]
+  allow_redirects: false
+limits:
+  timeout_seconds: 20
+  max_response_bytes: 2000000
+  requests_per_minute: 30
+health_check:
+  kind: module
+  timeout_seconds: 15
+  target: test_connection
+support:
+  documentation: https://cal.com/docs/api-reference/v2/slots/get-available-time-slots-for-an-event-type
+  owner: Harvey maintainers
+  minimum_harvey_version: 0.3.0
